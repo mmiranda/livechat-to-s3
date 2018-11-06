@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -18,26 +19,40 @@ var LiveChatLogin = os.Getenv("LIVECHAT_LOGIN")
 // LiveChatAPIKey stores your API KEY on LiveChat dashboard
 var LiveChatAPIKey = os.Getenv("LIVECHAT_API_KEY")
 
+var wg sync.WaitGroup
+
 func main() {
 	checkCredentials()
-	totalPages := GetTotalPages()
+	totalPages := int(GetTotalPages())
+
+	for i := 1; i <= totalPages; i++ {
+		wg.Add(1)
+		go getChatsByPage(i)
+	}
+	wg.Wait()
+
+}
+
+func getChatsByPage(page int) {
 
 	// Iterates through all pages
-	for i := 1; i <= int(totalPages); i++ {
-		fmt.Printf("Getting chats from page %d \n", i)
+	fmt.Printf("Getting chats from page %d \n", page)
 
-		// Iterates through all chats in that page
-		for _, chatID := range GetAllChats(i).Array() {
-			// fmt.Println(GetInfoAboutChat(chatID.String()))
-
-			// Gets info about specific chat
-			originalChat := GetInfoAboutChat(chatID.String())
-			createPath("./files/originals/")
-			saveToFile("originals/"+chatID.String()+".json", originalChat)
-			transcryptChat(originalChat)
-
-		}
+	// Iterates through all chats in that page
+	for _, chatID := range GetAllChats(page).Array() {
+		wg.Add(1)
+		go extractChatByID(chatID.String())
 	}
+	wg.Done()
+}
+
+func extractChatByID(chatID string) {
+	// Gets info about specific chat
+	originalChat := GetInfoAboutChat(chatID)
+	createPath("./files/originals/")
+	saveToFile("originals/"+chatID+".json", originalChat)
+	transcriptChat(originalChat)
+	wg.Done()
 }
 
 // RequestLiveChatAPI connects to LiveChatAPI and returns the specific result
@@ -50,7 +65,7 @@ func RequestLiveChatAPI(path string) string {
 	req.Header.Set("X-API-Version", "2")
 	req.SetBasicAuth(LiveChatLogin, LiveChatAPIKey)
 	resp, err := client.Do(req)
-	if err != nil {
+	if err != nil || resp.StatusCode != 200 {
 		log.Fatal(err)
 	}
 	bodyText, err := ioutil.ReadAll(resp.Body)
@@ -76,16 +91,16 @@ func GetInfoAboutChat(chatID string) string {
 	return RequestLiveChatAPI("chats/" + chatID)
 }
 
-// TranscryptChat extract the whole chat and write a transcryption in a separate file
-func transcryptChat(originalChat string) {
+// TranscriptChat extract the whole chat and write a transcription in a separate file
+func transcriptChat(originalChat string) {
 	visitorEmail := GetVisitorEmail(originalChat)
 
-	createPath("./files/transcrypt/")
-	createPath("./files/transcrypt/" + visitorEmail)
+	createPath("./files/transcript/")
+	createPath("./files/transcript/" + visitorEmail)
 
 	fileName := time.Unix(gjson.Get(originalChat, "started_timestamp").Int(), 0).Format("2006-01-02 1504")
 	header := "Original File is: ./originals/" + gjson.Get(originalChat, "id").String() + ".json\n"
-	saveToFile("transcrypt/"+visitorEmail+"/"+fileName+".txt", header)
+	saveToFile("transcript/"+visitorEmail+"/"+fileName+".txt", header)
 
 	messages := gjson.Get(originalChat, "events")
 	messages.ForEach(func(key, value gjson.Result) bool {
@@ -95,7 +110,7 @@ func transcryptChat(originalChat string) {
 			messageDetailed[1].String() + "|" +
 			messageDetailed[2].String() + "]  " +
 			messageDetailed[3].String()
-		saveToFile("transcrypt/"+visitorEmail+"/"+fileName+".txt", bufferMessage)
+		saveToFile("transcript/"+visitorEmail+"/"+fileName+".txt", bufferMessage)
 
 		return true // keep iterating
 	})
@@ -125,7 +140,6 @@ func GetVisitorEmail(originalChat string) string {
 func createPath(path string) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		os.Mkdir(path, 0777)
-		// fmt.Println(path)
 	}
 }
 
