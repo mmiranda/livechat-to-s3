@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"gopkg.in/cheggaaa/pb.v1"
 )
 
 // LiveChatLogin stores your login on LiveChat dashboard
@@ -20,26 +21,38 @@ var LiveChatLogin = os.Getenv("LIVECHAT_LOGIN")
 var LiveChatAPIKey = os.Getenv("LIVECHAT_API_KEY")
 
 var wg sync.WaitGroup
+var (
+	concurrency         = 5
+	concurrencyDetailed = 6
+	semaChan            = make(chan bool, concurrency)
+	semaChanDetailed    = make(chan bool, concurrencyDetailed)
+)
 
 func main() {
 	checkCredentials()
 	totalPages := int(GetTotalPages())
-
+	bar := pb.StartNew(totalPages)
 	for i := 1; i <= totalPages; i++ {
+		bar.Increment()
+		semaChan <- true // block while full
 		wg.Add(1)
 		go getChatsByPage(i)
 	}
 	wg.Wait()
+	bar.FinishPrint("All files exported!")
 
 }
 
 func getChatsByPage(page int) {
-
+	defer func() {
+		<-semaChan // read releases a slot
+	}()
 	// Iterates through all pages
-	fmt.Printf("Getting chats from page %d \n", page)
+	// fmt.Printf("Getting chats from page %d \n", page)
 
 	// Iterates through all chats in that page
 	for _, chatID := range GetAllChats(page).Array() {
+		semaChanDetailed <- true // block while full
 		wg.Add(1)
 		go extractChatByID(chatID.String())
 	}
@@ -47,6 +60,9 @@ func getChatsByPage(page int) {
 }
 
 func extractChatByID(chatID string) {
+	defer func() {
+		<-semaChanDetailed // read releases a slot
+	}()
 	// Gets info about specific chat
 	originalChat := GetInfoAboutChat(chatID)
 	createPath("./files/originals/")
@@ -66,6 +82,9 @@ func RequestLiveChatAPI(path string) string {
 	req.SetBasicAuth(LiveChatLogin, LiveChatAPIKey)
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != 200 {
+		// fmt.Printf("request path: %s\nresponse code: %s\n", path, string(resp.StatusCode))
+		fmt.Printf("Request path: %s\n", path)
+		fmt.Println(resp)
 		log.Fatal(err)
 	}
 	bodyText, err := ioutil.ReadAll(resp.Body)
