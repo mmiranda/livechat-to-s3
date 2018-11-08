@@ -1,15 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path"
+	"regexp"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/tidwall/gjson"
 	"gopkg.in/cheggaaa/pb.v1"
 )
@@ -20,18 +27,27 @@ var LiveChatLogin = os.Getenv("LIVECHAT_LOGIN")
 // LiveChatAPIKey stores your API KEY on LiveChat dashboard
 var LiveChatAPIKey = os.Getenv("LIVECHAT_API_KEY")
 
+const (
+	s3BucketName   = "your-bucket-name"
+	s3BucketRegion = "eu-west-1"
+	// Leave this empty if you want to save on root
+	s3BucketPath = ""
+)
+
 var wg sync.WaitGroup
 var (
-	concurrency         = 5
-	concurrencyDetailed = 6
+	concurrency         = 3
+	concurrencyDetailed = 3
+	concurrencyS3       = 50
 	semaChan            = make(chan bool, concurrency)
 	semaChanDetailed    = make(chan bool, concurrencyDetailed)
+	semaChanS3          = make(chan bool, concurrencyS3)
 )
 
 func main() {
 	checkCredentials()
 	totalPages := int(GetTotalPages())
-	bar := pb.StartNew(totalPages)
+	bar := pb.StartNew(totalPages).Prefix("Extracting pages")
 	for i := 1; i <= totalPages; i++ {
 		bar.Increment()
 		semaChan <- true // block while full
@@ -47,7 +63,6 @@ func getChatsByPage(page int) {
 	defer func() {
 		<-semaChan // read releases a slot
 	}()
-	// Iterates through all pages
 	// fmt.Printf("Getting chats from page %d \n", page)
 
 	// Iterates through all chats in that page
@@ -67,6 +82,11 @@ func extractChatByID(chatID string) {
 	originalChat := GetInfoAboutChat(chatID)
 	createPath("./files/originals/")
 	saveToFile("originals/"+chatID+".json", originalChat)
+
+	semaChanS3 <- true // block while full
+	wg.Add(1)
+	go uploadToS3("./files/originals/"+chatID+".json", s3BucketPath+"/originals/")
+
 	transcriptChat(originalChat)
 	wg.Done()
 }
@@ -82,10 +102,8 @@ func RequestLiveChatAPI(path string) string {
 	req.SetBasicAuth(LiveChatLogin, LiveChatAPIKey)
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != 200 {
-		// fmt.Printf("request path: %s\nresponse code: %s\n", path, string(resp.StatusCode))
-		fmt.Printf("Request path: %s\n", path)
+		fmt.Printf("request path: %s\n", path)
 		fmt.Println(resp)
-		log.Fatal(err)
 	}
 	bodyText, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -131,6 +149,10 @@ func transcriptChat(originalChat string) {
 			messageDetailed[3].String()
 		saveToFile("transcript/"+visitorEmail+"/"+fileName+".txt", bufferMessage)
 
+		// semaChanS3 <- true // block while full
+		wg.Add(1)
+		go uploadToS3("./files/transcript/"+visitorEmail+"/"+fileName+".txt", s3BucketPath+"/transcript/"+visitorEmail+"/")
+
 		return true // keep iterating
 	})
 
@@ -146,14 +168,23 @@ func GetVisitorEmail(originalChat string) string {
 	} else {
 		// SET A FALLBACK IN CASE EMAIL KEY DOES NOT EXISTS
 		result = gjson.Get(originalChat, "prechat_survey.#[key==\"E-mail:\"].value")
-		if result.Exists() {
+		if result.Exists() && len(result.String()) > 0 {
 			visitorEmail = result.String()
 		} else {
 			visitorEmail = "unknown"
 		}
 	}
 
-	return visitorEmail
+	return cleanCharacters(visitorEmail)
+}
+
+// Necessary because people often type their own email wrong
+func cleanCharacters(str string) string {
+	reg, err := regexp.Compile("[^a-zA-Z0-9\\-@+._]+")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return reg.ReplaceAllString(str, "")
 }
 
 func createPath(path string) {
@@ -171,11 +202,55 @@ func saveToFile(fileName string, content string) {
 	if _, err := f.WriteString(content + "\n"); err != nil {
 		log.Fatal(err)
 	}
-
 }
 
 func checkCredentials() {
 	if len(LiveChatLogin) == 0 || len(LiveChatAPIKey) == 0 {
 		log.Fatal("Missing LiveChat credentials")
 	}
+}
+
+func uploadToS3(localFile string, s3Path string) {
+	defer func() {
+		<-semaChanS3 // read releases a slot
+	}()
+
+	creds := credentials.NewSharedCredentials("", "")
+	_, err := creds.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	config := aws.NewConfig().WithRegion(s3BucketRegion).WithCredentials(creds)
+	s3Session := s3.New(session.New(), config)
+
+	file, err := os.Open(localFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+	fileInfo, _ := file.Stat()
+	size := fileInfo.Size()
+	buffer := make([]byte, size)
+
+	file.Read(buffer)
+	fileBytes := bytes.NewReader(buffer)
+	fileType := http.DetectContentType(buffer)
+
+	_, fileName := path.Split(file.Name())
+	path := s3Path + fileName
+
+	params := &s3.PutObjectInput{
+		Bucket:               aws.String(s3BucketName),
+		Key:                  aws.String(path),
+		Body:                 fileBytes,
+		ContentLength:        aws.Int64(size),
+		ContentType:          aws.String(fileType),
+		ServerSideEncryption: aws.String("AES256"),
+	}
+	_, err = s3Session.PutObject(params)
+	if err != nil {
+		log.Fatal(err)
+	}
+	wg.Done()
 }
