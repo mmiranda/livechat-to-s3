@@ -5,6 +5,12 @@ Go script to export all chats in LiveChat API (https://developers.livechatinc.co
 
 export LIVECHAT_API_KEY=\<\<PASTE HERE YOUR LIVECHAT API KEY\>\> LIVECHAT_LOGIN=\<\<PASTE HERE YOUR LIVECHAT LOGIN\>\> AWS_PROFILE=\<\<PASTE HERE YOUR PROFILE (~/.aws/credentials)\>\>
 
+# Running
+
+./export date_from date_to
+
+ex: ./export 2014-01-01 2018-11-01
+
 # Result
 
 This script will save a local copy of the files and save them on aws as well.
