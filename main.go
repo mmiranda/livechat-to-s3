@@ -18,7 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/tidwall/gjson"
-	"gopkg.in/cheggaaa/pb.v1"
+	pb "gopkg.in/cheggaaa/pb.v1"
 )
 
 // LiveChatLogin stores your login on LiveChat dashboard
@@ -36,7 +36,7 @@ const (
 
 var wg sync.WaitGroup
 var (
-	concurrency         = 3
+	concurrency         = 2
 	concurrencyDetailed = 3
 	concurrencyS3       = 50
 	semaChan            = make(chan bool, concurrency)
@@ -46,27 +46,43 @@ var (
 
 func main() {
 	checkCredentials()
-	totalPages := int(GetTotalPages())
-	bar := pb.StartNew(totalPages).Prefix("Extracting pages")
-	for i := 1; i <= totalPages; i++ {
-		bar.Increment()
-		semaChan <- true // block while full
-		wg.Add(1)
-		go getChatsByPage(i)
+
+	start, _ := time.Parse("2006-01-02", os.Args[0])
+	end, _ := time.Parse("2006-01-02", os.Args[1])
+
+	for rangeDate := rangeDate(start, end); ; {
+		dateFiltered := rangeDate().Format("2006-01-02")
+		// fmt.Println("Extracting date " + dateFiltered)
+		totalPages := int(getTotalPages(dateFiltered))
+
+		if totalPages == 0 {
+			continue
+		}
+		bar := pb.StartNew(totalPages).Prefix("Extracting pages for date: " + dateFiltered)
+		for i := 1; i <= totalPages; i++ {
+			bar.Increment()
+			semaChan <- true // block while full
+			wg.Add(1)
+			go getChatsByPage(dateFiltered, i)
+		}
+		bar.Finish()
 	}
 	wg.Wait()
-	bar.FinishPrint("All files exported!")
 
 }
 
-func getChatsByPage(page int) {
+func getChatsByPage(dateFiltered string, page int) {
 	defer func() {
 		<-semaChan // read releases a slot
 	}()
 	// fmt.Printf("Getting chats from page %d \n", page)
 
 	// Iterates through all chats in that page
-	for _, chatID := range GetAllChats(page).Array() {
+	for _, chatID := range GetAllChats(dateFiltered, page).Array() {
+		// Skip if we already have this file
+		if _, err := os.Stat("./files/originals/" + chatID.String() + ".json"); !os.IsNotExist(err) {
+			continue
+		}
 		semaChanDetailed <- true // block while full
 		wg.Add(1)
 		go extractChatByID(chatID.String())
@@ -104,6 +120,7 @@ func RequestLiveChatAPI(path string) string {
 	if err != nil || resp.StatusCode != 200 {
 		fmt.Printf("request path: %s\n", path)
 		fmt.Println(resp)
+		panic(resp)
 	}
 	bodyText, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -113,14 +130,14 @@ func RequestLiveChatAPI(path string) string {
 	return string(bodyText)
 }
 
-// GetTotalPages Gets total number of pages
-func GetTotalPages() int64 {
-	return gjson.Get(RequestLiveChatAPI("chats"), "pages").Int()
+// getTotalPages Gets total number of pages for an specific period
+func getTotalPages(dateFiltered string) int64 {
+	return gjson.Get(RequestLiveChatAPI("chats?date_from="+dateFiltered+"&date_to="+dateFiltered), "pages").Int()
 }
 
 // GetAllChats reads all chat_id in every page
-func GetAllChats(page int) gjson.Result {
-	return gjson.Get(RequestLiveChatAPI("chats?page="+strconv.Itoa(page)), "chats.#.id")
+func GetAllChats(dateFiltered string, page int) gjson.Result {
+	return gjson.Get(RequestLiveChatAPI("chats?page="+strconv.Itoa(page)+"&date_from="+dateFiltered+"&date_to="+dateFiltered), "chats.#.id")
 }
 
 // GetInfoAboutChat gets the raw text from an specific chat
@@ -149,12 +166,11 @@ func transcriptChat(originalChat string) {
 			messageDetailed[3].String()
 		saveToFile("transcript/"+visitorEmail+"/"+fileName+".txt", bufferMessage)
 
-		// semaChanS3 <- true // block while full
-		wg.Add(1)
-		go uploadToS3("./files/transcript/"+visitorEmail+"/"+fileName+".txt", s3BucketPath+"/transcript/"+visitorEmail+"/")
-
 		return true // keep iterating
 	})
+	// semaChanS3 <- true // block while full
+	wg.Add(1)
+	go uploadToS3("./files/transcript/"+visitorEmail+"/"+fileName+".txt", s3BucketPath+"/transcript/"+visitorEmail+"/")
 
 }
 
@@ -253,4 +269,20 @@ func uploadToS3(localFile string, s3Path string) {
 		log.Fatal(err)
 	}
 	wg.Done()
+}
+
+func rangeDate(start, end time.Time) func() time.Time {
+	y, m, d := start.Date()
+	start = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	y, m, d = end.Date()
+	end = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+
+	return func() time.Time {
+		if start.After(end) {
+			return time.Time{}
+		}
+		date := start
+		start = start.AddDate(0, 0, 1)
+		return date
+	}
 }
